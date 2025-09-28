@@ -1,0 +1,245 @@
+# Full-Stack Test Automation CI/CD Pipeline
+stages:
+  - setup
+  - lint
+  - web-tests
+  - api-tests
+  - performance-tests
+  - report
+  - deploy
+
+variables:
+  NODE_VERSION: "18"
+  PLAYWRIGHT_BROWSERS: "0"
+  CI: "true"
+  NODE_ENV: "test"
+
+# Cache configuration
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - .npm/
+    - .cache/
+
+# Setup stage
+setup:
+  stage: setup
+  image: node:${NODE_VERSION}
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+    - npx playwright install --with-deps
+  script:
+    - echo "Dependencies installed successfully"
+    - echo "Playwright browsers installed"
+  artifacts:
+    paths:
+      - node_modules/
+    expire_in: 1 hour
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+    policy: push
+
+# Linting stage
+lint:
+  stage: lint
+  image: node:${NODE_VERSION}
+  dependencies:
+    - setup
+  script:
+    - npm run lint
+    - npm run format -- --check
+  allow_failure: true
+  artifacts:
+    reports:
+      junit: test-results/lint-results.xml
+    expire_in: 1 week
+
+# Web Tests Stage
+web-tests:
+  stage: web-tests
+  image: node:${NODE_VERSION}
+  dependencies:
+    - setup
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+    - npx playwright install --with-deps
+  script:
+    - npm run test:web
+  artifacts:
+    when: always
+    paths:
+      - test-results/
+      - allure-results/
+      - playwright-report/
+    reports:
+      junit: test-results/results.xml
+    expire_in: 1 week
+  parallel:
+    matrix:
+      - BROWSER: [chromium, firefox, webkit]
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# API Tests Stage
+api-tests:
+  stage: api-tests
+  image: node:${NODE_VERSION}
+  dependencies:
+    - setup
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npm run test:api
+    - npm run test:coverage
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+      - allure-results/
+    reports:
+      junit: test-results/api-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    expire_in: 1 week
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# Performance Tests Stage
+performance-tests:
+  stage: performance-tests
+  image: loadimpact/k6:latest
+  dependencies:
+    - setup
+  before_script:
+    - echo "Setting up k6 performance tests"
+  script:
+    - k6 run tests/performance/api-load-test.js
+    - k6 run tests/performance/api-stress-test.js
+    - k6 run tests/performance/api-spike-test.js
+  artifacts:
+    when: always
+    paths:
+      - test-results/performance/
+    expire_in: 1 week
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+  allow_failure: true
+
+# Report Generation Stage
+generate-reports:
+  stage: report
+  image: node:${NODE_VERSION}
+  dependencies:
+    - web-tests
+    - api-tests
+    - performance-tests
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+  script:
+    - npm run report:generate
+    - echo "Reports generated successfully"
+  artifacts:
+    when: always
+    paths:
+      - allure-report/
+      - test-reports/
+    expire_in: 1 month
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# Slack Notification (on success)
+notify-success:
+  stage: deploy
+  image: node:${NODE_VERSION}
+  dependencies:
+    - generate-reports
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        node scripts/slack-notify.js success
+      else
+        echo "Slack webhook URL not configured, skipping notification"
+      fi
+  when: on_success
+  only:
+    - main
+    - develop
+
+# Slack Notification (on failure)
+notify-failure:
+  stage: deploy
+  image: node:${NODE_VERSION}
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        node scripts/slack-notify.js failure
+      else
+        echo "Slack webhook URL not configured, skipping notification"
+      fi
+  when: on_failure
+  only:
+    - main
+    - develop
+
+# Security Scanning (optional)
+security-scan:
+  stage: lint
+  image: node:${NODE_VERSION}
+  dependencies:
+    - setup
+  script:
+    - npm audit --audit-level moderate
+    - npx snyk test --severity-threshold=high
+  allow_failure: true
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# Docker Build and Push (optional)
+docker-build:
+  stage: deploy
+  image: docker:latest
+  services:
+    - docker:dind
+  dependencies:
+    - generate-reports
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - main
+  when: manual
+
+# Cleanup job
+cleanup:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - echo "Cleaning up temporary files"
+    - rm -rf node_modules/
+    - rm -rf .cache/
+  when: always
+  allow_failure: true

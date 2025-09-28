@@ -1,0 +1,164 @@
+version: '3.8'
+
+services:
+  # Web application (mock server for testing)
+  web-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+    command: npm run start:test-server
+    networks:
+      - test-network
+
+  # Web tests
+  web-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    depends_on:
+      - web-app
+    environment:
+      - BASE_URL=http://web-app:3000
+      - CI=true
+      - NODE_ENV=test
+    volumes:
+      - ./test-results:/app/test-results
+      - ./allure-results:/app/allure-results
+    command: npm run test:web
+    networks:
+      - test-network
+
+  # API tests
+  api-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      - API_BASE_URL=https://reqres.in/api
+      - CI=true
+      - NODE_ENV=test
+    volumes:
+      - ./test-results:/app/test-results
+      - ./allure-results:/app/allure-results
+      - ./coverage:/app/coverage
+    command: npm run test:api
+    networks:
+      - test-network
+
+  # Performance tests
+  performance-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: performance
+    environment:
+      - BASE_URL=https://reqres.in/api
+    volumes:
+      - ./test-results:/app/test-results
+    command: k6 run tests/performance/api-load-test.js
+    networks:
+      - test-network
+
+  # All tests runner
+  all-tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-runner
+    depends_on:
+      - web-app
+    environment:
+      - BASE_URL=http://web-app:3000
+      - API_BASE_URL=https://reqres.in/api
+      - CI=true
+      - NODE_ENV=test
+    volumes:
+      - ./test-results:/app/test-results
+      - ./allure-results:/app/allure-results
+      - ./coverage:/app/coverage
+      - ./test-reports:/app/test-reports
+    command: npm run test
+    networks:
+      - test-network
+
+  # Report generator
+  report-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    depends_on:
+      - web-tests
+      - api-tests
+      - performance-tests
+    environment:
+      - NODE_ENV=test
+    volumes:
+      - ./test-results:/app/test-results
+      - ./allure-results:/app/allure-results
+      - ./test-reports:/app/test-reports
+    command: npm run report:generate
+    networks:
+      - test-network
+
+  # Allure report server
+  allure-server:
+    image: frankescobar/allure-docker-service
+    ports:
+      - "5050:5050"
+    environment:
+      - CHECK_RESULTS_EVERY_SECONDS=3
+      - KEEP_HISTORY=1
+    volumes:
+      - ./allure-results:/app/allure-results
+      - ./allure-report:/app/default-reports
+    networks:
+      - test-network
+
+  # Test data generator
+  test-data-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      - NODE_ENV=test
+    volumes:
+      - ./test-data:/app/test-data
+    command: node scripts/generate-test-data.js
+    networks:
+      - test-network
+
+  # Mock server (WireMock alternative)
+  mock-server:
+    image: wiremock/wiremock:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mocks:/home/wiremock
+    command: --global-response-templating --verbose
+    networks:
+      - test-network
+
+networks:
+  test-network:
+    driver: bridge
+
+volumes:
+  test-results:
+  allure-results:
+  allure-report:
+  coverage:
+  test-reports:
+  test-data:
